@@ -1,0 +1,722 @@
+                                                 Example 2 all values saved file
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+"""
+FAST Fractional-Order PINN for Sharma-Tasso-Olver (STO) Equation
+=================================================================
+Example 2 from Malagi et al., IJOCTA 2023
+
+PDE:  D_t^alpha u + 3a u_x^2 + 3a u^2 u_x + 3a u u_xx + a u_xxx = 0
+
+Initial condition:
+    u(x,0) = -sqrt(2) * sqrt(B0) * tan(sqrt(B0)*x / sqrt(2))
+
+Exact solution (alpha=1):
+    u(x,t) = -sqrt(2*B0) * tan( (1/2)*sqrt(2*B0) * (x - lambda*t^alpha/Gamma(alpha+1)) )
+
+q-HAETM series (alpha < 1), from paper eq. 34:
+    u0 = -sqrt(2)*sqrt(B0)*tan(sqrt(B0)*x/sqrt(2))
+    u1 = -2*a*B0^2 * h * t^alpha * sec^2(sqrt(B0)*x/sqrt(2)) / Gamma(alpha+1)
+
+Parameters: B0=1, lambda=2, a=1, n=1, h=-1
+"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy.special import gamma as Gamma
+import os, sys, warnings
+warnings.filterwarnings('ignore')
+
+# ── params (Example 2) ────────────────────────────────────────────
+A       = 1.0
+B0      = 1.0
+LAM     = 2.0    # lambda
+N_HAM   = 1.0    # n
+H       = -1.0   # hbar
+
+ALPHA_LIST = [1.0, 0.75, 0.5]
+
+X_MIN, X_MAX = -1.0, 1.0     # tan blows up at pi/2 ~ 1.57, stay safe
+T_MIN, T_MAX =  0.0, 0.01    # small t so series is valid
+
+EPOCHS  = 15000
+LR      = 1e-3
+N_PDE   = 256
+N_IC    = 128
+N_BC    = 64
+HIDDEN  = 40
+LAYERS  = 4
+W_IC    = 10.0
+W_BC    = 10.0
+M_L1    = 8
+
+SAVE_DIR = 'fractional_STO_example2'
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Device: {device}")
+torch.manual_seed(42); np.random.seed(42)
+
+
+# ── reference / exact solutions ───────────────────────────────────
+def _tan_arg_exact(x, t, alpha):
+    """Argument of tan in exact solution."""
+    return 0.5 * np.sqrt(2*B0) * (x - LAM * t**alpha / Gamma(alpha+1))
+
+def ref_sol(x_np, t_np, alpha):
+    """
+    Reference solution for Example 2.
+    alpha=1  -> closed-form exact solution (eq. 35 paper)
+    alpha<1  -> q-HAETM 2-term series (eq. 34 paper)
+    """
+    # ── exact (any alpha, integer-order limit) ──
+    if alpha == 1.0:
+        arg = _tan_arg_exact(x_np, t_np, alpha)
+        # avoid blow-up near tan singularities
+        if abs(np.cos(arg)) < 1e-6:
+            return np.nan
+        return -np.sqrt(2*B0) * np.tan(arg)
+
+    # ── q-HAETM series ──
+    sqrt_arg = np.sqrt(B0) * x_np / np.sqrt(2)
+    cos_val  = np.cos(sqrt_arg)
+    if abs(cos_val) < 1e-6:          # near tan singularity
+        return np.nan
+
+    u0 = -np.sqrt(2) * np.sqrt(B0) * np.tan(sqrt_arg)
+    u1 = (-2 * A * B0**2 * H * t_np**alpha /
+           (Gamma(alpha+1) * cos_val**2))           # sec^2 = 1/cos^2
+    return u0 + u1 * (1.0 / N_HAM)
+
+def ic_np(x_np):
+    """u(x,0) for Example 2."""
+    sqrt_arg = np.sqrt(B0) * x_np / np.sqrt(2)
+    return -np.sqrt(2) * np.sqrt(B0) * np.tan(sqrt_arg)
+
+def ref_sol_safe(x_np, t_np, alpha):
+    """ref_sol with nan replaced by 0 (for grid plotting)."""
+    v = ref_sol(x_np, t_np, alpha)
+    return 0.0 if (v is None or np.isnan(v)) else float(np.clip(v, -20, 20))
+
+
+# ── PINN model ────────────────────────────────────────────────────
+class PINN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        lyrs = [nn.Linear(2, HIDDEN), nn.Tanh()]
+        for _ in range(LAYERS - 1):
+            lyrs += [nn.Linear(HIDDEN, HIDDEN), nn.Tanh()]
+        lyrs.append(nn.Linear(HIDDEN, 1))
+        self.net = nn.Sequential(*lyrs)
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight,
+                    gain=nn.init.calculate_gain('tanh'))
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x, t):
+        return self.net(torch.cat([x, t], dim=1))
+
+
+# ── vectorized L1 Caputo ──────────────────────────────────────────
+def caputo_l1_vec(model, x, t, alpha, M=M_L1):
+    if alpha == 1.0:
+        t_ = t.detach().clone().requires_grad_(True)
+        u  = model(x, t_)
+        return torch.autograd.grad(u, t_, torch.ones_like(u),
+                                   create_graph=True)[0]
+
+    B  = x.shape[0]
+    G  = Gamma(2.0 - alpha)
+    dt = t / M                                              # (B,1)
+    idx    = torch.arange(M+1, dtype=torch.float32,
+                          device=device).unsqueeze(0)       # (1,M+1)
+    nodes  = idx * dt                                       # (B,M+1)
+    x_rep  = x.repeat_interleave(M+1, dim=0)               # (B*(M+1),1)
+    t_flat = nodes.reshape(-1, 1)                           # (B*(M+1),1)
+    u_flat = model(x_rep, t_flat)                           # (B*(M+1),1)
+    u_nodes= u_flat.reshape(B, M+1)                         # (B,M+1)
+    j   = torch.arange(M, dtype=torch.float32, device=device)
+    bj  = (j+1)**(1-alpha) - j**(1-alpha)                  # (M,)
+    du  = u_nodes[:, 1:] - u_nodes[:, :-1]                 # (B,M)
+    cap = (bj.unsqueeze(0) * du).sum(dim=1)                # (B,)
+    cap = cap / (dt.squeeze(1) ** alpha * G)
+    return cap.unsqueeze(1)                                 # (B,1)
+
+
+# ── PDE residual (same STO equation) ─────────────────────────────
+def pde_res(model, x, t, alpha):
+    x_ = x.detach().clone().requires_grad_(True)
+    u   = model(x_, t)
+    ux  = torch.autograd.grad(u,   x_, torch.ones_like(u),
+                               create_graph=True)[0]
+    uxx = torch.autograd.grad(ux,  x_, torch.ones_like(ux),
+                               create_graph=True)[0]
+    uxxx= torch.autograd.grad(uxx, x_, torch.ones_like(uxx),
+                               create_graph=True)[0]
+    Dtu = caputo_l1_vec(model, x_, t, alpha)
+    return Dtu + 3*A*ux**2 + 3*A*(u**2)*ux + 3*A*u*uxx + A*uxxx
+
+
+# ── loss ──────────────────────────────────────────────────────────
+def loss_fn(model, x_pde, t_pde, x_ic, x_bc, t_bc, alpha):
+    # PDE loss
+    res   = pde_res(model, x_pde, t_pde, alpha)
+    l_pde = res.pow(2).mean()
+
+    # IC loss
+    t_ic    = torch.zeros_like(x_ic)
+    u_ic_p  = model(x_ic, t_ic)
+    xic_np  = x_ic.detach().cpu().numpy().flatten()
+    u_ic_r  = torch.tensor(
+        np.array([ic_np(xi) for xi in xic_np], dtype=np.float32),
+        device=device).view(-1, 1)
+    l_ic    = (u_ic_p - u_ic_r).pow(2).mean()
+
+    # BC loss
+    xbc_np  = x_bc.detach().cpu().numpy().flatten()
+    tbc_np  = t_bc.detach().cpu().numpy().flatten()
+    u_bc_r  = torch.tensor(
+        np.array([ref_sol_safe(xbc_np[i], tbc_np[i], alpha)
+                  for i in range(len(xbc_np))], dtype=np.float32),
+        device=device).view(-1, 1)
+    u_bc_p  = model(x_bc, t_bc)
+    l_bc    = (u_bc_p - u_bc_r).pow(2).mean()
+
+    total   = l_pde + W_IC*l_ic + W_BC*l_bc
+    return total, l_pde.item(), l_ic.item(), l_bc.item()
+
+
+# ── training ──────────────────────────────────────────────────────
+def train(alpha):
+    print(f"\n{'─'*55}")
+    print(f"  Training  alpha = {alpha}  ({EPOCHS} epochs)")
+    print(f"{'─'*55}")
+    model = PINN().to(device)
+    opt   = torch.optim.Adam(model.parameters(), lr=LR)
+    sch   = torch.optim.lr_scheduler.StepLR(opt, step_size=1500, gamma=0.8)
+    hist  = dict(total=[], pde=[], ic=[], bc=[])
+
+    for ep in range(EPOCHS):
+        x_pde = (torch.rand(N_PDE,1,device=device)*(X_MAX-X_MIN)+X_MIN)
+        t_pde = (torch.rand(N_PDE,1,device=device)*(T_MAX-T_MIN)+T_MIN)
+        x_ic  = (torch.rand(N_IC, 1,device=device)*(X_MAX-X_MIN)+X_MIN)
+        xL    = torch.full((N_BC,1), X_MIN, device=device)
+        xR    = torch.full((N_BC,1), X_MAX, device=device)
+        tBC   = (torch.rand(2*N_BC,1,device=device)*(T_MAX-T_MIN)+T_MIN)
+        x_bc  = torch.cat([xL, xR])
+
+        loss, lp, li, lb = loss_fn(model, x_pde, t_pde,
+                                    x_ic, x_bc, tBC, alpha)
+        opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step(); sch.step()
+
+        hist['total'].append(loss.item())
+        hist['pde'].append(lp)
+        hist['ic'].append(li)
+        hist['bc'].append(lb)
+
+        if (ep+1) % 1000 == 0:
+            print(f"  ep {ep+1:5d} | total {loss.item():.3e} "
+                  f"pde {lp:.3e} ic {li:.3e} bc {lb:.3e}")
+
+    model.eval()
+    return model, hist
+
+
+# ── grid helpers ──────────────────────────────────────────────────
+@torch.no_grad()
+def pred_grid(model, nx=80, nt=40):
+    xv = torch.linspace(X_MIN, X_MAX, nx, device=device).float()
+    tv = torch.linspace(T_MIN, T_MAX, nt, device=device).float()
+    X, T = torch.meshgrid(xv, tv, indexing='ij')
+    U = model(X.reshape(-1,1), T.reshape(-1,1)).reshape(nx, nt)
+    return X.cpu().numpy(), T.cpu().numpy(), U.cpu().numpy()
+
+def ref_grid(alpha, nx=80, nt=40):
+    xv = np.linspace(X_MIN, X_MAX, nx)
+    tv = np.linspace(T_MIN, T_MAX, nt)
+    X, T = np.meshgrid(xv, tv, indexing='ij')
+    U = np.vectorize(lambda xi,ti: ref_sol_safe(xi,ti,alpha))(X, T)
+    return X, T, U
+
+
+# ── colour / style maps ───────────────────────────────────────────
+COLORS = {1.0:'#2563eb', 0.75:'#dc2626', 0.5:'#16a34a'}
+LS     = {1.0:'-',       0.75:'--',      0.5:'-.'}
+
+
+# ── PLOT 1 — Loss history ─────────────────────────────────────────
+def plot_loss(histories):
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    for ax, key, title in zip(axes,
+            ['total','pde','ic'],
+            ['Total Loss','PDE Loss','IC Loss']):
+        for alpha, hist in zip(ALPHA_LIST, histories):
+            ax.semilogy(hist[key], color=COLORS[alpha],
+                        lw=1.4, label=f'α={alpha}')
+        ax.set_title(title); ax.set_xlabel('Epoch')
+        ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+    plt.suptitle('Training Loss ', fontsize=13, y=1.01)
+    plt.tight_layout()
+    plt.savefig(f'{SAVE_DIR}/01_loss_history.png', dpi=150, bbox_inches='tight')
+    plt.close(); print("  ✓ 01_loss_history.png")
+
+
+# ── PLOT 2 — 3D surfaces per alpha ───────────────────────────────
+def plot_3d(models_dict):
+    for alpha in ALPHA_LIST:
+        X, T, Up = pred_grid(models_dict[alpha])
+        X2,T2,Ur = ref_grid(alpha)
+        err       = np.abs(Up - Ur)
+        fig = plt.figure(figsize=(16, 4.5))
+        for i,(data,title,cm) in enumerate(zip(
+                [Up, Ur, err],
+                ['PINN', 'Exact', f'|Error|  max={err.max():.2e}'],
+                ['viridis','plasma','inferno'])):
+            ax = fig.add_subplot(1,3,i+1, projection='3d')
+            ax.plot_surface(X, T, data, cmap=cm, linewidth=0, alpha=0.9)
+            ax.set_title(f'{title}\nα={alpha}', fontsize=9)
+            ax.set_xlabel('x'); ax.set_ylabel('t'); ax.set_zlabel('u')
+        plt.tight_layout()
+        tag = str(alpha).replace('.','p')
+        plt.savefig(f'{SAVE_DIR}/02_3d_alpha{tag}.png', dpi=150,
+                    bbox_inches='tight')
+        plt.close()
+    print("  ✓ 02_3d_alpha*.png")
+
+
+# ── PLOT 3 — Contours all alpha ───────────────────────────────────
+def plot_contour(models_dict):
+    fig, axes = plt.subplots(len(ALPHA_LIST), 3,
+                             figsize=(13, 4*len(ALPHA_LIST)))
+    for row, alpha in enumerate(ALPHA_LIST):
+        X, T, Up = pred_grid(models_dict[alpha])
+        X2,T2,Ur = ref_grid(alpha)
+        err       = np.abs(Up - Ur)
+        for col,(data,label) in enumerate(zip(
+                [Up, Ur, err], ['PINN','Exact','|Error|'])):
+            ax = axes[row, col]
+            cm = 'inferno' if col==2 else 'viridis'
+            cf = ax.contourf(X, T, data, levels=40, cmap=cm)
+            fig.colorbar(cf, ax=ax, pad=0.02)
+            ax.set_title(f'α={alpha}  {label}', fontsize=10)
+            ax.set_xlabel('x'); ax.set_ylabel('t')
+    plt.suptitle('Contour Plots — PINN vs Exact ',
+                 fontsize=13, y=1.01)
+    plt.tight_layout()
+    plt.savefig(f'{SAVE_DIR}/03_contours_all.png', dpi=150, bbox_inches='tight')
+    plt.close(); print("  ✓ 03_contours_all.png")
+
+
+# ── PLOT 4 — u vs t at fixed x (paper Fig 5 style) ───────────────
+def plot_fig5_style(models_dict, x_fixed=5.0):
+    """Replicates paper Figure 5: u(x,t) vs t for distinct alpha."""
+    # Note: x=5 is outside [-1,1] domain; use x=0.5 instead
+    x_fixed = 0.5
+    tv = np.linspace(T_MIN, T_MAX, 200)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    for ax, use_pinn in zip(axes, [True, False]):
+        for alpha in ALPHA_LIST:
+            vals = []
+            if use_pinn:
+                xT = torch.tensor([[x_fixed]], dtype=torch.float32, device=device)
+                for t_val in tv:
+                    tT = torch.tensor([[t_val]], dtype=torch.float32, device=device)
+                    with torch.no_grad():
+                        vals.append(models_dict[alpha](xT, tT).item())
+            else:
+                vals = [ref_sol_safe(x_fixed, tv_i, alpha) for tv_i in tv]
+            ax.plot(tv, vals, color=COLORS[alpha], ls=LS[alpha],
+                    lw=2.2, label=f'α={alpha}')
+        label = 'PINN' if use_pinn else ' Exact'
+        ax.set_title(f'{label},  x={x_fixed}', fontsize=12)
+        ax.set_xlabel('t', fontsize=12); ax.set_ylabel('u(x,t)', fontsize=12)
+        ax.legend(fontsize=11); ax.grid(True, alpha=0.25)
+    plt.suptitle('u(x,t) vs t — Distinct α  (Paper Fig. 5 Style)',
+                 fontsize=13, y=1.01)
+    plt.tight_layout()
+    plt.savefig(f'{SAVE_DIR}/04_fig5_style.png', dpi=150, bbox_inches='tight')
+    plt.close(); print("  ✓ 04_fig5_style.png")
+
+
+# ── PLOT 5 — u vs x at fixed times ───────────────────────────────
+def plot_vs_x(models_dict):
+    t_list = [0.0, 0.002, 0.005, 0.01]
+    xv     = np.linspace(X_MIN, X_MAX, 200)
+    fig, axes = plt.subplots(1, len(t_list), figsize=(5*len(t_list), 5))
+    for ax, tf in zip(axes, t_list):
+        for alpha in ALPHA_LIST:
+            u_ref  = np.array([ref_sol_safe(xi, tf, alpha) for xi in xv])
+            u_pinn = []
+            tT = torch.tensor([[tf]], dtype=torch.float32, device=device)
+            for xval in xv:
+                xT = torch.tensor([[xval]], dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    u_pinn.append(models_dict[alpha](xT, tT).item())
+            ax.plot(xv, u_pinn, color=COLORS[alpha], lw=2,
+                    ls=LS[alpha], label=f'PINN α={alpha}')
+            ax.plot(xv, u_ref,  color=COLORS[alpha], lw=1.2,
+                    ls=':', alpha=0.8, label=f'Ref α={alpha}')
+        ax.set_title(f't={tf}', fontsize=11)
+        ax.set_xlabel('x'); ax.set_ylabel('u')
+        ax.legend(fontsize=6); ax.grid(True, alpha=0.3)
+    plt.suptitle('PINN (solid) vs EXact (dotted) at Fixed Times ',
+                 fontsize=12, y=1.01)
+    plt.tight_layout()
+    plt.savefig(f'{SAVE_DIR}/05_vs_x_fixed_t.png', dpi=150,
+                bbox_inches='tight')
+    plt.close(); print("  ✓ 05_vs_x_fixed_t.png")
+
+
+# ── PLOT 6 — Error heatmaps ───────────────────────────────────────
+def plot_error_heatmap(models_dict):
+    fig, axes = plt.subplots(1, len(ALPHA_LIST),
+                             figsize=(5*len(ALPHA_LIST), 4))
+    for ax, alpha in zip(axes, ALPHA_LIST):
+        X, T, Up = pred_grid(models_dict[alpha])
+        X2,T2,Ur = ref_grid(alpha)
+        err       = np.abs(Up - Ur)
+        im = ax.contourf(X, T, err, levels=40, cmap='inferno')
+        fig.colorbar(im, ax=ax, label='|Error|')
+        ax.set_title(f'α={alpha}  max={err.max():.2e}', fontsize=11)
+        ax.set_xlabel('x'); ax.set_ylabel('t')
+    plt.suptitle('Absolute Error Heatmaps ', fontsize=13, y=1.01)
+    plt.tight_layout()
+    plt.savefig(f'{SAVE_DIR}/06_error_heatmaps.png', dpi=150,
+                bbox_inches='tight')
+    plt.close(); print("  ✓ 06_error_heatmaps.png")
+
+
+# ── TABLE — Absolute errors (paper Table 3 style) ─────────────────
+def build_tables(models_dict):
+    """
+    Paper Table 3: x in {0.1,0.2,0.3,0.4,0.5}, t in {0.001, 0.01},
+    alpha in {1, 0.75, 0.5}
+    """
+    x_vals  = [0.1, 0.2, 0.3, 0.4, 0.5]
+    t_cases = {'t=0.001': 0.001, 't=0.01': 0.01}
+
+    frames = {}
+    for t_label, t_val in t_cases.items():
+        rows = []
+        for xv in x_vals:
+            row = {'x': xv}
+            for alpha in ALPHA_LIST:
+                xT = torch.tensor([[float(xv)]], dtype=torch.float32, device=device)
+                tT = torch.tensor([[t_val]],     dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    u_p = models_dict[alpha](xT, tT).item()
+                u_r = ref_sol_safe(float(xv), t_val, alpha)
+                row[f'PINN_a{alpha}'] = u_p
+                row[f'Ref_a{alpha}']  = u_r
+                row[f'Err_a{alpha}']  = abs(u_p - u_r)
+            rows.append(row)
+        frames[t_label] = pd.DataFrame(rows)
+
+    # Excel
+    xls = f'{SAVE_DIR}/error_tables.xlsx'
+    with pd.ExcelWriter(xls, engine='openpyxl') as writer:
+        for sheet, df in frames.items():
+            df.to_excel(writer, sheet_name=sheet, index=False)
+    print(f"  ✓ error_tables.xlsx")
+
+    # Print console
+    for t_label, df in frames.items():
+        print(f"\n{'='*90}")
+        print(f"  Absolute Error Table  —  {t_label}  (Example 2)")
+        print(f"{'='*90}")
+        err_cols = [c for c in df.columns if 'Err' in c]
+        rename   = {c: f'|Err| α={c.split("_a")[1]}' for c in err_cols}
+        print(df[['x']+err_cols].rename(columns=rename).to_string(index=False))
+
+    return frames
+
+
+# ── PLOT 7 — Error bar chart ──────────────────────────────────────
+def plot_error_bars(frames):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    x_labels = [0.1, 0.2, 0.3, 0.4, 0.5]
+    x_pos    = np.arange(len(x_labels))
+    width    = 0.25
+    for ax, (t_label, df) in zip(axes, frames.items()):
+        for i, alpha in enumerate(ALPHA_LIST):
+            ax.bar(x_pos + i*width,
+                   df[f'Err_a{alpha}'].values,
+                   width, label=f'α={alpha}',
+                   color=COLORS[alpha], alpha=0.85, edgecolor='white')
+        ax.set_yscale('log')
+        ax.set_xticks(x_pos + width)
+        ax.set_xticklabels([str(v) for v in x_labels])
+        ax.set_xlabel('x', fontsize=12)
+        ax.set_ylabel('|Error|', fontsize=12)
+        ax.set_title(f'Absolute Error  ({t_label})', fontsize=12)
+        ax.legend(); ax.grid(True, alpha=0.3, axis='y')
+    plt.suptitle('Absolute Errors: PINN vs Exact',
+                 fontsize=13, y=1.01)
+    plt.tight_layout()
+    plt.savefig(f'{SAVE_DIR}/07_error_bars.png', dpi=150, bbox_inches='tight')
+    plt.close(); print("  ✓ 07_error_bars.png")
+
+
+# ── PLOT 8 — PDE Residual Analysis (per alpha) ───────────────────
+def plot_residual_analysis(models_dict):
+    n_pts = 800
+    for alpha in ALPHA_LIST:
+        model = models_dict[alpha]
+        x_test = (torch.rand(n_pts, 1, device=device) *
+                  (X_MAX - X_MIN) + X_MIN).float()
+        t_test = (torch.rand(n_pts, 1, device=device) *
+                  (T_MAX - T_MIN) + T_MIN).float()
+
+        res_list = []
+        bs = 100
+        for i in range(0, n_pts, bs):
+            xb = x_test[i:i+bs]
+            tb = t_test[i:i+bs]
+            r  = pde_res(model, xb, tb, alpha)
+            res_list.append(r.detach().cpu().numpy().flatten())
+        residuals = np.concatenate(res_list)
+
+        x_np = x_test.detach().cpu().numpy().flatten()
+        t_np = t_test.detach().cpu().numpy().flatten()
+
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+        # histogram
+        ax = axes[0]
+        ax.hist(residuals, bins=50, color='#7b2d8b',
+                alpha=0.8, edgecolor='white')
+        mean_r = np.mean(residuals)
+        ax.axvline(mean_r, color='red', ls='--', lw=2,
+                   label=f'Mean: {mean_r:.2e}')
+        ax.set_xlabel('PDE Residual', fontsize=12)
+        ax.set_ylabel('Frequency',    fontsize=12)
+        ax.set_title('PDE Residual Distribution', fontsize=13)
+        ax.legend(); ax.grid(True, alpha=0.3)
+
+        # scatter |residual| over domain
+        ax = axes[1]
+        sc = ax.scatter(x_np, t_np, c=np.abs(residuals),
+                        cmap='coolwarm', alpha=0.7, s=18)
+        plt.colorbar(sc, ax=ax, label='|Residual|')
+        ax.set_xlabel('x', fontsize=12)
+        ax.set_ylabel('t', fontsize=12)
+        ax.set_title('PDE Residual Magnitude Distribution', fontsize=13)
+        ax.grid(True, alpha=0.3)
+
+        plt.suptitle(f'PDE Residual Analysis  —  α={alpha} ,',
+                     fontsize=14, y=1.01)
+        plt.tight_layout()
+        tag = str(alpha).replace('.', 'p')
+        plt.savefig(f'{SAVE_DIR}/08_residual_alpha{tag}.png',
+                    dpi=150, bbox_inches='tight')
+        plt.close()
+    print("  ✓ 08_residual_alpha*.png")
+
+
+# ── PLOT 9 — Weight Matrices Heatmap (per alpha) ─────────────────
+def plot_weight_heatmaps(models_dict):
+    for alpha in ALPHA_LIST:
+        model = models_dict[alpha]
+        linear_layers = [m for m in model.net if isinstance(m, nn.Linear)]
+        n_layers = len(linear_layers)
+        n_cols   = 3
+        n_rows   = (n_layers + n_cols - 1) // n_cols
+
+        fig, axes = plt.subplots(n_rows, n_cols,
+                                 figsize=(5*n_cols, 4*n_rows))
+        axes = axes.flatten()
+
+        for idx, layer in enumerate(linear_layers):
+            W_mat = layer.weight.data.cpu().numpy()
+            disp  = W_mat[:min(50, W_mat.shape[0]),
+                          :min(50, W_mat.shape[1])]
+            im = axes[idx].imshow(disp, cmap='RdBu',
+                                  aspect='auto', interpolation='nearest')
+            axes[idx].set_title(
+                f'layer_{idx}_weights\nShape: {W_mat.shape}', fontsize=9)
+            axes[idx].set_xlabel('Output Neurons', fontsize=8)
+            axes[idx].set_ylabel('Input Neurons',  fontsize=8)
+            plt.colorbar(im, ax=axes[idx], fraction=0.046, pad=0.04)
+
+        for idx in range(n_layers, len(axes)):
+            axes[idx].axis('off')
+
+        plt.suptitle(f'Weight Matrices Heatmaps  —  α={alpha}  ,',
+                     fontsize=13, y=1.01)
+        plt.tight_layout()
+        tag = str(alpha).replace('.', 'p')
+        plt.savefig(f'{SAVE_DIR}/09_weight_heatmap_alpha{tag}.png',
+                    dpi=150, bbox_inches='tight')
+        plt.close()
+    print("  ✓ 09_weight_heatmap_alpha*.png")
+
+
+# ── PLOT 10 — Weights & Biases Distribution (per alpha) ──────────
+def plot_weights_distribution(models_dict):
+    for alpha in ALPHA_LIST:
+        model = models_dict[alpha]
+        linear_layers = [m for m in model.net if isinstance(m, nn.Linear)]
+
+        params = []
+        for idx, layer in enumerate(linear_layers):
+            params.append((f'layer_{idx}_weights',
+                           layer.weight.data.cpu().numpy()))
+            params.append((f'layer_{idx}_biases',
+                           layer.bias.data.cpu().numpy()))
+
+        n_params = len(params)
+        n_cols   = 4
+        n_rows   = (n_params + n_cols - 1) // n_cols
+
+        fig, axes = plt.subplots(n_rows, n_cols,
+                                 figsize=(4.5*n_cols, 3.5*n_rows))
+        axes = axes.flatten()
+
+        for idx, (name, arr) in enumerate(params):
+            ax    = axes[idx]
+            color = 'blue' if 'weights' in name else 'green'
+            ax.hist(arr.flatten(), bins=40,
+                    alpha=0.75, color=color, edgecolor='white')
+            mean_v = np.mean(arr)
+            ax.axvline(mean_v, color='red', ls='--', lw=1.2)
+            ax.set_title(f'{name}\nShape: {arr.shape}', fontsize=8)
+            lbl = 'Weight Values' if 'weights' in name else 'Bias Values'
+            ax.set_xlabel(lbl,         fontsize=7)
+            ax.set_ylabel('Frequency', fontsize=7)
+            ax.text(0.04, 0.95, f'Mean: {mean_v:.3e}',
+                    transform=ax.transAxes, fontsize=7,
+                    verticalalignment='top')
+            ax.grid(True, alpha=0.25)
+
+        for idx in range(n_params, len(axes)):
+            axes[idx].axis('off')
+
+        plt.suptitle(f'Weights and Biases Distribution  —  α={alpha} ,',
+                     fontsize=13, y=1.01)
+        plt.tight_layout()
+        tag = str(alpha).replace('.', 'p')
+        plt.savefig(f'{SAVE_DIR}/10_weights_dist_alpha{tag}.png',
+                    dpi=150, bbox_inches='tight')
+        plt.close()
+    print("  ✓ 10_weights_dist_alpha*.png")
+
+
+# ── NEW FUNCTION: Save all solutions to Excel ─────────────────────
+def save_all_solutions_to_excel(models_dict):
+    """
+    Save complete solution grids (all x,t points) to Excel files for each alpha.
+    Each Excel file will contain PINN predictions, Reference solutions, and Errors.
+    """
+    nx, nt = 80, 40  # Same grid resolution as plotting
+
+    for alpha in ALPHA_LIST:
+        print(f"  Saving complete solution for α={alpha}...")
+
+        # Get grid predictions
+        X, T, Up_pred = pred_grid(models_dict[alpha], nx=nx, nt=nt)
+        _, _, Ur_ref = ref_grid(alpha, nx=nx, nt=nt)
+
+        # Flatten the grids for Excel storage
+        x_flat = X.flatten()
+        t_flat = T.flatten()
+        u_pinn_flat = Up_pred.flatten()
+        u_ref_flat = Ur_ref.flatten()
+        error_flat = np.abs(Up_pred - Ur_ref).flatten()
+
+        # Create DataFrame with all values
+        df = pd.DataFrame({
+            'x': x_flat,
+            't': t_flat,
+            'PINN_solution': u_pinn_flat,
+            'Reference_solution': u_ref_flat,
+            'Absolute_Error': error_flat
+        })
+
+        # Create filename
+        filename = f'{SAVE_DIR}/complete_solutions_alpha_{str(alpha).replace(".", "p")}.xlsx'
+
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            # Sheet 1: All flattened data (complete dataset)
+            df.to_excel(writer, sheet_name='All_Data_Flattened', index=False)
+
+            # Sheet 2: Grid format - X coordinates
+            pd.DataFrame(X).to_excel(writer, sheet_name='X_grid', index=False, header=False)
+
+            # Sheet 3: Grid format - T coordinates
+            pd.DataFrame(T).to_excel(writer, sheet_name='T_grid', index=False, header=False)
+
+            # Sheet 4: PINN solution in grid format
+            pd.DataFrame(Up_pred).to_excel(writer, sheet_name='PINN_solution_grid', index=False, header=False)
+
+            # Sheet 5: Reference solution in grid format
+            pd.DataFrame(Ur_ref).to_excel(writer, sheet_name='Reference_solution_grid', index=False, header=False)
+
+            # Sheet 6: Error in grid format
+            pd.DataFrame(np.abs(Up_pred - Ur_ref)).to_excel(writer, sheet_name='Error_grid', index=False, header=False)
+
+            # Sheet 7: Summary statistics
+            summary = pd.DataFrame({
+                'Metric': ['Min', 'Max', 'Mean', 'Std', 'RMSE'],
+                'PINN_Solution': [
+                    np.min(Up_pred), np.max(Up_pred), np.mean(Up_pred), np.std(Up_pred),
+                    np.sqrt(np.mean((Up_pred - Ur_ref)**2))
+                ],
+                'Reference_Solution': [
+                    np.min(Ur_ref), np.max(Ur_ref), np.mean(Ur_ref), np.std(Ur_ref),
+                    np.sqrt(np.mean((Up_pred - Ur_ref)**2))
+                ],
+                'Absolute_Error': [
+                    np.min(error_flat), np.max(error_flat), np.mean(error_flat), np.std(error_flat),
+                    np.sqrt(np.mean((Up_pred - Ur_ref)**2))
+                ]
+            })
+            summary.to_excel(writer, sheet_name='Summary_Statistics', index=False)
+
+            # Sheet 8: Sample of first 1000 points (for quick preview)
+            df.head(1000).to_excel(writer, sheet_name='Sample_First_1000', index=False)
+
+        print(f"  ✓ Saved complete solution grid for α={alpha} ({len(df)} points)")
+
+
+# ── MAIN ──────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    models_dict = {}
+    histories   = []
+
+    for alpha in ALPHA_LIST:
+        m, h = train(alpha)
+        models_dict[alpha] = m
+        histories.append(h)
+        torch.save(m.state_dict(),
+                   f'{SAVE_DIR}/model_a{str(alpha).replace(".","p")}.pth')
+
+    print(f"\n{'─'*55}\n  Generating plots ...\n{'─'*55}")
+
+    plot_loss(histories)
+    plot_3d(models_dict)
+    plot_contour(models_dict)
+    plot_fig5_style(models_dict)
+    plot_vs_x(models_dict)
+    plot_error_heatmap(models_dict)
+    frames = build_tables(models_dict)  # This saves the 5-point tables (kept as is)
+    plot_error_bars(frames)
+    plot_residual_analysis(models_dict)
+    plot_weight_heatmaps(models_dict)
+    plot_weights_distribution(models_dict)
+
+    # NEW: Save all solution values to Excel (complete grids)
+    print(f"\n{'─'*55}\n  Saving complete solution grids to Excel ...\n{'─'*55}")
+    save_all_solutions_to_excel(models_dict)
+
+    print(f"\n{'='*55}")
+    print(f"  ALL DONE! Files in '{SAVE_DIR}/'")
+    print(f"{'='*55}")
+    for f in sorted(os.listdir(SAVE_DIR)):
+        print(f"   {f}")
